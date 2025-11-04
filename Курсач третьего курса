@@ -1,0 +1,644 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from models import db, User, Product, Category, CartItem
+from datetime import datetime
+import os
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'belaz-parts-secret-key-2024'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:Enatan2023@localhost/belaz_parts_db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db.init_app(app)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Пожалуйста, войдите для доступа к этой странице.'
+login_manager.login_message_category = 'info'
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@app.route('/')
+def index():
+    category_id = request.args.get('category_id', type=int)
+    sort_by = request.args.get('sort_by', 'name')
+    search = request.args.get('search', '')
+    
+    query = Product.query
+    
+    if category_id:
+        query = query.filter_by(category_id=category_id)
+    
+    if search:
+        query = query.filter(Product.name.ilike(f'%{search}%'))
+    
+    if sort_by == 'price_asc':
+        query = query.order_by(Product.price.asc())
+    elif sort_by == 'price_desc':
+        query = query.order_by(Product.price.desc())
+    elif sort_by == 'name':
+        query = query.order_by(Product.name.asc())
+    elif sort_by == 'newest':
+        query = query.order_by(Product.created_at.desc())
+    
+    products = query.all()
+    categories = Category.query.all()
+    
+    return render_template('index.html', 
+                         products=products, 
+                         categories=categories,
+                         current_category=category_id,
+                         sort_by=sort_by,
+                         search=search)
+
+@app.route('/product/<int:product_id>')
+def product_detail(product_id):
+    product = Product.query.get_or_404(product_id)
+    return render_template('product.html', product=product)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+        
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+        
+        errors = []
+        
+        if len(username) < 3 or len(username) > 80:
+            errors.append('Имя пользователя должно быть от 3 до 80 символов')
+            
+        if len(password) < 6:
+            errors.append('Пароль должен содержать минимум 6 символов')
+            
+        if password != confirm_password:
+            errors.append('Пароли не совпадают')
+        
+        if User.query.filter_by(username=username).first():
+            errors.append('Имя пользователя уже занято')
+        
+        if User.query.filter_by(email=email).first():
+            errors.append('Email уже зарегистрирован')
+            
+        if errors:
+            for error in errors:
+                flash(error, 'danger')
+            return redirect(url_for('register'))
+        
+        hashed_password = generate_password_hash(password)
+        user = User(username=username, email=email, password=hashed_password)
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        login_user(user)
+        flash(f'Регистрация успешна! Добро пожаловать, {username}!', 'success')
+        return redirect(url_for('index'))
+    
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+        
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = User.query.filter_by(username=username).first()
+        
+        if user and check_password_hash(user.password, password):
+            login_user(user)
+            next_page = request.args.get('next')
+            
+            if user.is_admin:
+                flash(f'Добро пожаловать, администратор {username}!', 'success')
+                return redirect(next_page or url_for('admin'))
+            else:
+                flash(f'Добро пожаловать, {username}!', 'success')
+                return redirect(next_page or url_for('index'))
+        else:
+            flash('Неверное имя пользователя или пароль', 'danger')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    username = current_user.username
+    logout_user()
+    flash(f'Вы успешно вышли из системы. До свидания, {username}!', 'info')
+    return redirect(url_for('index'))
+
+@app.route('/add_to_cart/<int:product_id>')
+@login_required
+def add_to_cart(product_id):
+    """Добавление товара в корзину"""
+    try:
+        product = Product.query.get_or_404(product_id)
+        
+        if product.stock <= 0:
+            flash('Этот товар временно отсутствует на складе', 'warning')
+            return redirect(request.referrer or url_for('index'))
+        
+        cart_item = CartItem.query.filter_by(
+            user_id=current_user.id, 
+            product_id=product_id
+        ).first()
+        
+        if cart_item:
+            if cart_item.quantity >= product.stock:
+                flash('Нельзя добавить больше товара, чем есть в наличии', 'warning')
+                return redirect(request.referrer or url_for('index'))
+            cart_item.quantity += 1
+        else:
+            cart_item = CartItem(
+                user_id=current_user.id, 
+                product_id=product_id,
+                quantity=1
+            )
+            db.session.add(cart_item)
+        
+        db.session.commit()
+        flash(f'"{product.name}" добавлен в корзину! 🛒', 'success')
+        
+    except Exception as e:
+        db.session.rollback()
+        flash('Произошла ошибка при добавлении товара в корзину', 'danger')
+        print(f"Error adding to cart: {e}")
+    
+    return redirect(request.referrer or url_for('index'))
+
+@app.route('/cart')
+@login_required
+def cart():
+    """Страница корзины"""
+    try:
+        # Получаем все товары в корзине текущего пользователя
+        cart_items = CartItem.query.filter_by(user_id=current_user.id).all()
+        
+        total = sum(item.product.price * item.quantity for item in cart_items)
+        
+        return render_template('cart.html', 
+                             cart_items=cart_items, 
+                             total=total,
+                             cart_count=len(cart_items))
+                             
+    except Exception as e:
+        flash('Произошла ошибка при загрузке корзины', 'danger')
+        print(f"Error loading cart: {e}")
+        return render_template('cart.html', cart_items=[], total=0, cart_count=0)
+
+@app.route('/remove_from_cart/<int:cart_item_id>')
+@login_required
+def remove_from_cart(cart_item_id):
+    """Удаление товара из корзины"""
+    try:
+        cart_item = CartItem.query.get_or_404(cart_item_id)
+        
+        # Проверяем, что товар принадлежит текущему пользователю
+        if cart_item.user_id != current_user.id:
+            flash('Доступ запрещен', 'danger')
+            return redirect(url_for('cart'))
+        
+        product_name = cart_item.product.name
+        db.session.delete(cart_item)
+        db.session.commit()
+        
+        flash(f'"{product_name}" удален из корзины', 'info')
+        
+    except Exception as e:
+        db.session.rollback()
+        flash('Произошла ошибка при удалении товара из корзины', 'danger')
+        print(f"Error removing from cart: {e}")
+    
+    return redirect(url_for('cart'))
+
+@app.route('/update_cart_quantity/<int:cart_item_id>', methods=['POST'])
+@login_required
+def update_cart_quantity(cart_item_id):
+    """Обновление количества товара в корзине (AJAX)"""
+    try:
+        cart_item = CartItem.query.get_or_404(cart_item_id)
+        
+        if cart_item.user_id != current_user.id:
+            return jsonify({'success': False, 'error': 'Доступ запрещен'})
+        
+        new_quantity = request.json.get('quantity', 1)
+        
+        # Если количество меньше 1, удаляем товар из корзины
+        if new_quantity < 1:
+            db.session.delete(cart_item)
+            db.session.commit()
+            return jsonify({
+                'success': True, 
+                'removed': True,
+                'message': 'Товар удален из корзины'
+            })
+        
+        # Проверяем, что не превышаем доступное количество
+        if new_quantity > cart_item.product.stock:
+            return jsonify({
+                'success': False, 
+                'error': f'Недостаточно товара на складе. Доступно: {cart_item.product.stock} шт.'
+            })
+        
+        # Обновляем количество
+        cart_item.quantity = new_quantity
+        db.session.commit()
+        
+        # Пересчитываем общую стоимость
+        cart_items = CartItem.query.filter_by(user_id=current_user.id).all()
+        total = sum(item.product.price * item.quantity for item in cart_items)
+        item_total = cart_item.product.price * cart_item.quantity
+        
+        return jsonify({
+            'success': True, 
+            'item_total': item_total,
+            'total': total,
+            'quantity': cart_item.quantity
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'Произошла ошибка'})
+
+@app.route('/clear_cart')
+@login_required
+def clear_cart():
+    """Очистка всей корзины"""
+    try:
+        # Удаляем все товары текущего пользователя из корзины
+        deleted_count = CartItem.query.filter_by(user_id=current_user.id).delete()
+        db.session.commit()
+        
+        flash(f'Корзина очищена. Удалено товаров: {deleted_count}', 'info')
+        
+    except Exception as e:
+        db.session.rollback()
+        flash('Произошла ошибка при очистке корзины', 'danger')
+        print(f"Error clearing cart: {e}")
+    
+    return redirect(url_for('cart'))
+
+@app.route('/admin')
+@login_required
+def admin():
+    if not current_user.is_admin:
+        flash('Доступ запрещен. Требуются права администратора.', 'danger')
+        return redirect(url_for('index'))
+    
+    products = Product.query.all()
+    categories = Category.query.all()
+    users = User.query.all()
+    
+    stats = {
+        'total_products': len(products),
+        'total_categories': len(categories),
+        'total_users': len(users),
+        'low_stock_products': Product.query.filter(Product.stock < 10).count()
+    }
+    
+    return render_template('admin.html', 
+                         products=products, 
+                         categories=categories,
+                         users=users,
+                         stats=stats)
+
+@app.route('/admin/add_product', methods=['POST'])
+@login_required
+def add_product():
+    if not current_user.is_admin:
+        flash('Доступ запрещен. Требуются права администратора.', 'danger')
+        return redirect(url_for('index'))
+    
+    try:
+        name = request.form['name']
+        description = request.form['description']
+        price = float(request.form['price'])
+        stock = int(request.form['stock'])
+        category_id = int(request.form['category_id'])
+        part_number = request.form['part_number']
+        image_url = request.form.get('image_url', '')
+        
+        if Product.query.filter_by(part_number=part_number).first():
+            flash('Товар с таким артикулом уже существует', 'warning')
+            return redirect(url_for('admin'))
+        
+        product = Product(
+            name=name,
+            description=description,
+            price=price,
+            stock=stock,
+            category_id=category_id,
+            part_number=part_number,
+            image_url=image_url
+        )
+        
+        db.session.add(product)
+        db.session.commit()
+        
+        flash(f'Товар "{name}" успешно добавлен!', 'success')
+        
+    except Exception as e:
+        flash(f'Ошибка при добавлении товара: {str(e)}', 'danger')
+    
+    return redirect(url_for('admin'))
+
+@app.route('/admin/edit_product/<int:product_id>', methods=['POST'])
+@login_required
+def edit_product(product_id):
+    if not current_user.is_admin:
+        flash('Доступ запрещен. Требуются права администратора.', 'danger')
+        return redirect(url_for('index'))
+    
+    product = Product.query.get_or_404(product_id)
+    
+    try:
+        product.name = request.form['name']
+        product.description = request.form['description']
+        product.price = float(request.form['price'])
+        product.stock = int(request.form['stock'])
+        product.category_id = int(request.form['category_id'])
+        product.part_number = request.form['part_number']
+        product.image_url = request.form.get('image_url', '')
+        
+        db.session.commit()
+        flash(f'Товар "{product.name}" успешно обновлен!', 'success')
+        
+    except Exception as e:
+        flash(f'Ошибка при обновлении товара: {str(e)}', 'danger')
+    
+    return redirect(url_for('admin'))
+
+@app.route('/admin/delete_product/<int:product_id>')
+@login_required
+def delete_product(product_id):
+    if not current_user.is_admin:
+        flash('Доступ запрещен. Требуются права администратора.', 'danger')
+        return redirect(url_for('index'))
+    
+    product = Product.query.get_or_404(product_id)
+    product_name = product.name
+    
+    # Удаляем связанные записи в корзине
+    CartItem.query.filter_by(product_id=product_id).delete()
+    
+    db.session.delete(product)
+    db.session.commit()
+    
+    flash(f'Товар "{product_name}" успешно удален!', 'success')
+    return redirect(url_for('admin'))
+
+@app.route('/admin/add_category', methods=['POST'])
+@login_required
+def add_category():
+    if not current_user.is_admin:
+        flash('Доступ запрещен. Требуются права администратора.', 'danger')
+        return redirect(url_for('index'))
+    
+    name = request.form['name']
+    description = request.form['description']
+    
+    if Category.query.filter_by(name=name).first():
+        flash('Категория с таким названием уже существует', 'warning')
+        return redirect(url_for('admin'))
+    
+    category = Category(name=name, description=description)
+    db.session.add(category)
+    db.session.commit()
+    
+    flash(f'Категория "{name}" успешно добавлена!', 'success')
+    return redirect(url_for('admin'))
+
+@app.route('/admin/delete_category/<int:category_id>')
+@login_required
+def delete_category(category_id):
+    if not current_user.is_admin:
+        flash('Доступ запрещен. Требуются права администратора.', 'danger')
+        return redirect(url_for('index'))
+    
+    category = Category.query.get_or_404(category_id)
+    category_name = category.name
+    
+    # Проверяем, есть ли товары в этой категории
+    if category.products:
+        flash(f'Нельзя удалить категорию "{category_name}", так как в ней есть товары', 'danger')
+        return redirect(url_for('admin'))
+    
+    db.session.delete(category)
+    db.session.commit()
+    
+    flash(f'Категория "{category_name}" успешно удалена!', 'success')
+    return redirect(url_for('admin'))
+
+@app.route('/profile')
+@login_required
+def profile():
+    user_orders = []  
+    return render_template('profile.html', user_orders=user_orders)
+
+@app.route('/search')
+def search():
+    query = request.args.get('q', '')
+    if not query:
+        return redirect(url_for('index'))
+    
+    products = Product.query.filter(
+        Product.name.ilike(f'%{query}%') | 
+        Product.description.ilike(f'%{query}%') |
+        Product.part_number.ilike(f'%{query}%')
+    ).all()
+    
+    categories = Category.query.all()
+    
+    return render_template('index.html', 
+                         products=products, 
+                         categories=categories,
+                         search=query,
+                         search_query=query)
+
+@app.context_processor
+def utility_processor():
+    def format_price(price):
+        return "{:,.2f}".format(price).replace(',', ' ')
+    
+    def get_cart_count():
+        if current_user.is_authenticated:
+            return CartItem.query.filter_by(user_id=current_user.id).count()
+        return 0
+    
+    def get_cart_items():
+        if current_user.is_authenticated:
+            return CartItem.query.filter_by(user_id=current_user.id).all()
+        return []
+    
+    def is_admin():
+        return current_user.is_authenticated and current_user.is_admin
+    
+    return {
+        'format_price': format_price,
+        'get_cart_count': get_cart_count,
+        'get_cart_items': get_cart_items,
+        'is_admin': is_admin
+    }
+
+@app.errorhandler(404)
+def not_found_error(error):
+    return render_template('404.html'), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return render_template('500.html'), 500
+
+@app.errorhandler(403)
+def forbidden_error(error):
+    return render_template('403.html'), 403
+
+if __name__ == '__main__':
+    with app.app_context():
+        try:
+            db.create_all()
+            
+            # Создаем администратора по умолчанию
+            if not User.query.filter_by(username='admin').first():
+                admin_user = User(
+                    username='admin',
+                    email='admin@belaz.by',
+                    password=generate_password_hash('admin123'),
+                    is_admin=True
+                )
+                db.session.add(admin_user)
+                print(" Администратор создан: admin / admin123")
+            
+            # Создаем тестового пользователя
+            if not User.query.filter_by(username='user').first():
+                test_user = User(
+                    username='user',
+                    email='user@belaz.by',
+                    password=generate_password_hash('user123'),
+                    is_admin=False
+                )
+                db.session.add(test_user)
+                print(" Тестовый пользователь создан: user / user123")
+            
+            # Создаем базовые категории
+            if not Category.query.first():
+                categories = [
+                    Category(name='Двигатель', description='Запчасти для двигателя БЕЛАЗ'),
+                    Category(name='Трансмиссия', description='Трансмиссионные запчасти'),
+                    Category(name='Ходовая часть', description='Запчасти ходовой части'),
+                    Category(name='Электрика', description='Электрооборудование и проводка'),
+                    Category(name='Фильтры', description='Фильтры и масла'),
+                    Category(name='Тормозная система', description='Тормозные колодки и диски'),
+                    Category(name='Гидравлика', description='Гидравлические системы'),
+                    Category(name='Кабина', description='Запчасти для кабины водителя'),
+                ]
+                db.session.add_all(categories)
+                print("✅ Базовые категории созданы")
+            
+            
+            if not Product.query.first():
+                engine_category = Category.query.filter_by(name='Двигатель').first()
+                brakes_category = Category.query.filter_by(name='Тормозная система').first()
+                filters_category = Category.query.filter_by(name='Фильтры').first()
+                transmission_category = Category.query.filter_by(name='Трансмиссия').first()
+                chassis_category = Category.query.filter_by(name='Ходовая часть').first()
+                electric_category = Category.query.filter_by(name='Электрика').first()
+                hydraulic_category = Category.query.filter_by(name='Гидравлика').first()
+                cabin_category = Category.query.filter_by(name='Кабина').first()
+                
+                test_products = [
+                    Product(
+                        name='Фильтр масляный ДВС БЕЛАЗ-7555',
+                        description='Масляный фильтр для двигателя БЕЛАЗ-7555. Оригинальный производитель. Высококачественные материалы, обеспечивающие надежную защиту двигателя.',
+                        price=12500.00,
+                        stock=15,
+                        category_id=filters_category.id if filters_category else 5,
+                        part_number='BEL-FM-7555',
+                        image_url='https://via.placeholder.com/400x300?text=Фильтр+масляный'
+                    ),
+                    Product(
+                        name='Тормозная колодка передняя БЕЛАЗ-75600',
+                        description='Тормозная колодка переднего моста БЕЛАЗ-75600. Высококачественный материал, обеспечивающий надежное торможение в любых условиях.',
+                        price=34500.00,
+                        stock=8,
+                        category_id=brakes_category.id if brakes_category else 6,
+                        part_number='BEL-TK-75600',
+                        image_url='https://via.placeholder.com/400x300?text=Тормозная+колодка'
+                    ),
+                    Product(
+                        name='Свеча накаливания 24V',
+                        description='Свеча накаливания для дизельного двигателя. Напряжение 24V. Обеспечивает надежный запуск двигателя в холодное время года.',
+                        price=8500.00,
+                        stock=25,
+                        category_id=engine_category.id if engine_category else 1,
+                        part_number='BEL-SN-240',
+                        image_url='https://via.placeholder.com/400x300?text=Свеча+накаливания'
+                    ),
+                    Product(
+                        name='Ремень ГРМ БЕЛАЗ-7525',
+                        description='Ремень газораспределительного механизма для БЕЛАЗ-7525. Высокая износостойкость, оригинальное качество.',
+                        price=28700.00,
+                        stock=12,
+                        category_id=engine_category.id if engine_category else 1,
+                        part_number='BEL-RGM-7525',
+                        image_url='https://via.placeholder.com/400x300?text=Ремень+ГРМ'
+                    ),
+                    Product(
+                        name='Топливный фильтр тонкой очистки',
+                        description='Фильтр тонкой очистки топлива. Защищает топливную систему от загрязнений, обеспечивает стабильную работу двигателя.',
+                        price=9800.00,
+                        stock=30,
+                        category_id=filters_category.id if filters_category else 5,
+                        part_number='BEL-TF-001',
+                        image_url='https://via.placeholder.com/400x300?text=Топливный+фильтр'
+                    ),
+                    Product(
+                        name='Аккумулятор 190А/ч',
+                        description='Тяговый аккумулятор для карьерного самосвала. Высокая емкость, надежность в экстремальных условиях.',
+                        price=152000.00,
+                        stock=4,
+                        category_id=electric_category.id if electric_category else 4,
+                        part_number='BEL-ACC-190',
+                        image_url='https://via.placeholder.com/400x300?text=Аккумулятор'
+                    ),
+                    Product(
+                        name='Амортизатор передний',
+                        description='Амортизатор передней подвески. Обеспечивает плавность хода и устойчивость автомобиля.',
+                        price=65400.00,
+                        stock=6,
+                        category_id=chassis_category.id if chassis_category else 3,
+                        part_number='BEL-AMP-7560',
+                        image_url='https://via.placeholder.com/400x300?text=Амортизатор'
+                    ),
+                    Product(
+                        name='Гидроцилиндр рулевого управления',
+                        description='Основной гидроцилиндр рулевого управления. Надежность и долговечность в тяжелых условиях эксплуатации.',
+                        price=189000.00,
+                        stock=3,
+                        category_id=hydraulic_category.id if hydraulic_category else 7,
+                        part_number='BEL-GC-RU',
+                        image_url='https://via.placeholder.com/400x300?text=Гидроцилиндр'
+                    )
+                ]
+                db.session.add_all(test_products)
+                print(" Тестовые товары созданы")
+            
+            db.session.commit()
+            print(" Успешно")
+            
+        except Exception as e:
+            print(f" Ошибка при инициализации базы данных: {e}")
+            db.session.rollback()
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
